@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 (2026-04-01)
+
+- Add user segment targeting with `define_segment()` and `remove_segment()` for enabling flags by user group attributes
+- Add flag dependencies with `add_dependency()` and `remove_dependency()` so flags can require other flags to be enabled
+- Add scheduled activation with `schedule()` and `remove_schedule()` to enable/disable flags at specific datetimes
+- Add `remove_listener()` to unregister change callbacks
+- Add `snapshot()` and `restore()` for capturing and replaying full store state in tests
+
 ## 0.2.1 (2026-03-31)
 
 - Standardize README to 3-badge format with emoji Support section
