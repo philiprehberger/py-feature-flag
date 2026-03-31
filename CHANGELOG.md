@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (2026-03-31)
+
+- Standardize README to 3-badge format with emoji Support section
+- Update CI checkout action to v5 for Node.js 24 compatibility
+
 ## 0.2.0 (2026-03-27)
 
 - Add `on_change(callback)` for registering change callbacks on flag load, set, or override
