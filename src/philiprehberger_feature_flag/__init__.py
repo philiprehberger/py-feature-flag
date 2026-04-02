@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -21,6 +22,13 @@ class FlagStore:
         self._overrides: dict[str, bool] = {}
         self._lock = Lock()
         self._callbacks: list[Callable[[str, Any, Any], None]] = []
+        self._segments: dict[str, dict[str, Any]] = {}
+        self._dependencies: dict[str, list[str]] = {}
+        self._schedules: dict[str, dict[str, datetime]] = {}
+
+    # ------------------------------------------------------------------
+    # Change listeners
+    # ------------------------------------------------------------------
 
     def on_change(self, callback: Callable[[str, Any, Any], None]) -> None:
         """Register a callback fired as ``callback(flag_name, old_value, new_value)``
@@ -32,10 +40,23 @@ class FlagStore:
         with self._lock:
             self._callbacks.append(callback)
 
+    def remove_listener(self, callback: Callable[[str, Any, Any], None]) -> None:
+        """Remove a previously registered change callback.
+
+        Args:
+            callback: The callback to remove.
+        """
+        with self._lock:
+            self._callbacks = [cb for cb in self._callbacks if cb is not callback]
+
     def _fire_callbacks(self, name: str, old: Any, new: Any) -> None:
         """Notify all registered callbacks of a flag change."""
         for cb in self._callbacks:
             cb(name, old, new)
+
+    # ------------------------------------------------------------------
+    # Core flag operations
+    # ------------------------------------------------------------------
 
     def load(self, config: dict[str, Any] | str | None = None) -> None:
         """Load flags from a dict, a JSON file path, or environment variables.
@@ -77,15 +98,39 @@ class FlagStore:
             {"enabled": bool}
             {"enabled": bool, "rollout": int}        # percentage 0-100
             {"enabled": bool, "users": ["uid", ...]}  # allowlist
+            {"enabled": bool, "segments": ["seg"]}     # segment targeting
 
         For ``rollout``, the caller must pass ``user_id`` in *context*.
         For ``users``, the caller must pass ``user_id`` in *context*.
+        For ``segments``, the caller must pass matching attributes in *context*.
+
+        Respects flag dependencies, scheduled activation, and overrides.
         """
         with self._lock:
             if name in self._overrides:
                 return self._overrides[name]
 
             value = self._flags.get(name)
+
+        # Check schedule constraints
+        schedule = self._get_schedule(name)
+        if schedule is not None:
+            now = context.get("now")
+            if not isinstance(now, datetime):
+                now = datetime.now(timezone.utc)
+            activate_at = schedule.get("activate_at")
+            deactivate_at = schedule.get("deactivate_at")
+            if activate_at is not None and now < activate_at:
+                return False
+            if deactivate_at is not None and now >= deactivate_at:
+                return False
+
+        # Check flag dependencies
+        deps = self._get_dependencies(name)
+        if deps:
+            for dep in deps:
+                if not self.is_enabled(dep, **context):
+                    return False
 
         if value is None:
             return False
@@ -105,6 +150,14 @@ class FlagStore:
                 if user_id is not None and user_id in users:
                     return True
                 if users and user_id not in (users or []):
+                    return False
+
+            # Segment targeting check
+            segments: list[str] | None = value.get("segments")
+            if segments is not None:
+                if self._matches_any_segment(segments, context):
+                    return True
+                if segments:
                     return False
 
             # Percentage rollout check
@@ -161,6 +214,172 @@ class FlagStore:
             else:
                 result[name] = value
         return result
+
+    # ------------------------------------------------------------------
+    # User segment targeting
+    # ------------------------------------------------------------------
+
+    def define_segment(
+        self, name: str, attributes: dict[str, Any]
+    ) -> None:
+        """Define a user segment with required attribute values.
+
+        A segment matches a user context when every attribute in the segment
+        definition matches the corresponding value in the context.
+
+        Args:
+            name: Segment identifier (e.g. ``"beta_testers"``).
+            attributes: Dict of attribute key-value pairs that must match.
+        """
+        with self._lock:
+            self._segments[name] = dict(attributes)
+
+    def remove_segment(self, name: str) -> None:
+        """Remove a previously defined segment.
+
+        Args:
+            name: Segment identifier to remove.
+        """
+        with self._lock:
+            self._segments.pop(name, None)
+
+    def _matches_any_segment(
+        self, segment_names: list[str], context: dict[str, Any]
+    ) -> bool:
+        """Return True if the context matches any of the named segments."""
+        with self._lock:
+            segments = {
+                k: v for k, v in self._segments.items() if k in segment_names
+            }
+        for attrs in segments.values():
+            if all(context.get(k) == v for k, v in attrs.items()):
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Flag dependencies
+    # ------------------------------------------------------------------
+
+    def add_dependency(self, flag: str, depends_on: str) -> None:
+        """Declare that *flag* requires *depends_on* to be enabled.
+
+        When checking ``is_enabled(flag)``, all dependencies must also
+        be enabled or the flag returns ``False``.
+
+        Args:
+            flag: The flag that has the dependency.
+            depends_on: The flag that must be enabled first.
+        """
+        with self._lock:
+            self._dependencies.setdefault(flag, [])
+            if depends_on not in self._dependencies[flag]:
+                self._dependencies[flag].append(depends_on)
+
+    def remove_dependency(self, flag: str, depends_on: str) -> None:
+        """Remove a dependency from a flag.
+
+        Args:
+            flag: The flag to update.
+            depends_on: The dependency to remove.
+        """
+        with self._lock:
+            deps = self._dependencies.get(flag, [])
+            if depends_on in deps:
+                deps.remove(depends_on)
+                if not deps:
+                    del self._dependencies[flag]
+
+    def _get_dependencies(self, flag: str) -> list[str]:
+        """Return the list of dependencies for a flag."""
+        with self._lock:
+            return list(self._dependencies.get(flag, []))
+
+    # ------------------------------------------------------------------
+    # Scheduled activation
+    # ------------------------------------------------------------------
+
+    def schedule(
+        self,
+        name: str,
+        *,
+        activate_at: datetime | None = None,
+        deactivate_at: datetime | None = None,
+    ) -> None:
+        """Schedule a flag to activate and/or deactivate at specific times.
+
+        Scheduled times are compared against UTC. Pass a ``now`` keyword
+        to ``is_enabled()`` to override the current time (useful for testing).
+
+        Args:
+            name: The flag name.
+            activate_at: Enable the flag starting at this datetime.
+            deactivate_at: Disable the flag starting at this datetime.
+        """
+        entry: dict[str, datetime] = {}
+        if activate_at is not None:
+            entry["activate_at"] = activate_at
+        if deactivate_at is not None:
+            entry["deactivate_at"] = deactivate_at
+        with self._lock:
+            self._schedules[name] = entry
+
+    def remove_schedule(self, name: str) -> None:
+        """Remove the schedule for a flag.
+
+        Args:
+            name: The flag name whose schedule should be removed.
+        """
+        with self._lock:
+            self._schedules.pop(name, None)
+
+    def _get_schedule(self, name: str) -> dict[str, datetime] | None:
+        """Return the schedule for a flag, or None if not scheduled."""
+        with self._lock:
+            sched = self._schedules.get(name)
+            return dict(sched) if sched else None
+
+    # ------------------------------------------------------------------
+    # Snapshot and restore (testing helpers)
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict[str, Any]:
+        """Capture the full state of the store for later restoration.
+
+        Returns a dict containing flags, overrides, segments, dependencies,
+        schedules, and callbacks. Useful for test setup/teardown.
+
+        Returns:
+            A serialisable snapshot dict.
+        """
+        with self._lock:
+            return {
+                "flags": dict(self._flags),
+                "overrides": dict(self._overrides),
+                "segments": {k: dict(v) for k, v in self._segments.items()},
+                "dependencies": {k: list(v) for k, v in self._dependencies.items()},
+                "schedules": {k: dict(v) for k, v in self._schedules.items()},
+                "callbacks": list(self._callbacks),
+            }
+
+    def restore(self, snap: dict[str, Any]) -> None:
+        """Restore the store to a previously captured snapshot.
+
+        Args:
+            snap: A snapshot dict produced by :meth:`snapshot`.
+        """
+        with self._lock:
+            self._flags = dict(snap.get("flags", {}))
+            self._overrides = dict(snap.get("overrides", {}))
+            self._segments = {
+                k: dict(v) for k, v in snap.get("segments", {}).items()
+            }
+            self._dependencies = {
+                k: list(v) for k, v in snap.get("dependencies", {}).items()
+            }
+            self._schedules = {
+                k: dict(v) for k, v in snap.get("schedules", {}).items()
+            }
+            self._callbacks = list(snap.get("callbacks", []))
 
     # ------------------------------------------------------------------
     # Internal helpers
