@@ -25,6 +25,7 @@ class FlagStore:
         self._segments: dict[str, dict[str, Any]] = {}
         self._dependencies: dict[str, list[str]] = {}
         self._schedules: dict[str, dict[str, datetime]] = {}
+        self._metrics: dict[str, dict[str, int]] = {}
 
     # ------------------------------------------------------------------
     # Change listeners
@@ -105,7 +106,30 @@ class FlagStore:
         For ``segments``, the caller must pass matching attributes in *context*.
 
         Respects flag dependencies, scheduled activation, and overrides.
+
+        Each call increments per-flag usage counters tracked under
+        ``export_metrics()`` (``enabled_count``, ``disabled_count``,
+        ``total_evaluations``).
         """
+        result = self._evaluate(name, **context)
+        with self._lock:
+            entry = self._metrics.get(name)
+            if entry is None:
+                entry = {
+                    "enabled_count": 0,
+                    "disabled_count": 0,
+                    "total_evaluations": 0,
+                }
+                self._metrics[name] = entry
+            entry["total_evaluations"] += 1
+            if result:
+                entry["enabled_count"] += 1
+            else:
+                entry["disabled_count"] += 1
+        return result
+
+    def _evaluate(self, name: str, **context: Any) -> bool:
+        """Compute whether a flag is enabled without touching usage metrics."""
         with self._lock:
             if name in self._overrides:
                 return self._overrides[name]
@@ -129,7 +153,7 @@ class FlagStore:
         deps = self._get_dependencies(name)
         if deps:
             for dep in deps:
-                if not self.is_enabled(dep, **context):
+                if not self._evaluate(dep, **context):
                     return False
 
         if value is None:
@@ -188,9 +212,45 @@ class FlagStore:
             self._fire_callbacks(name, old, value)
 
     def reset(self) -> None:
-        """Clear all runtime overrides."""
+        """Clear all runtime overrides.
+
+        Usage metrics are tracked independently of overrides and flag
+        definitions. Calling :meth:`reset` does not clear them; use
+        :meth:`reset_metrics` to zero counters.
+        """
         with self._lock:
             self._overrides.clear()
+
+    def export_metrics(self) -> dict[str, dict[str, int]]:
+        """Return a snapshot of per-flag usage counters.
+
+        Each :meth:`is_enabled` call increments counters for the flag::
+
+            {
+                "<flag_name>": {
+                    "enabled_count": int,
+                    "disabled_count": int,
+                    "total_evaluations": int,
+                },
+                ...
+            }
+
+        Returns:
+            A deep-copied dict that is safe to read or mutate without
+            affecting the live counters.
+        """
+        with self._lock:
+            return {k: dict(v) for k, v in self._metrics.items()}
+
+    def reset_metrics(self) -> None:
+        """Zero all usage counters without touching flag definitions.
+
+        Flag definitions, overrides, segments, dependencies, and schedules
+        are left intact — only the metrics tracked by :meth:`export_metrics`
+        are cleared.
+        """
+        with self._lock:
+            self._metrics.clear()
 
     def group(self, prefix: str) -> dict[str, Any]:
         """Return resolved values for all flags whose name starts with *prefix*.

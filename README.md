@@ -160,6 +160,26 @@ flags.override("beta_ui", True)   # force-enable for testing
 flags.reset()                     # clear all overrides
 ```
 
+### Usage metrics
+
+```python
+from philiprehberger_feature_flag import flags
+
+flags.load({"dark_mode": True, "beta": False})
+
+flags.is_enabled("dark_mode")
+flags.is_enabled("dark_mode")
+flags.is_enabled("beta")
+
+flags.export_metrics()
+# {
+#     "dark_mode": {"enabled_count": 2, "disabled_count": 0, "total_evaluations": 2},
+#     "beta":      {"enabled_count": 0, "disabled_count": 1, "total_evaluations": 1},
+# }
+
+flags.reset_metrics()  # zero counters; flag definitions untouched
+```
+
 ### Flag groups
 
 ```python
@@ -196,6 +216,8 @@ ui_flags = flags.group("ui_")
 | `store.remove_schedule(name)` | Remove the schedule for a flag |
 | `store.snapshot()` | Capture full store state (flags, overrides, segments, dependencies, schedules) |
 | `store.restore(snap)` | Restore the store to a previously captured snapshot |
+| `store.export_metrics()` | Return a snapshot of per-flag `enabled_count`, `disabled_count`, and `total_evaluations` counters |
+| `store.reset_metrics()` | Zero all usage counters without touching flag definitions |
 | `flags` | Module-level `FlagStore` instance |
 
 ## Development

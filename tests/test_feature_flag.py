@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from threading import Thread
 
 from philiprehberger_feature_flag import FlagStore
 
@@ -445,3 +446,132 @@ def test_snapshot_is_isolated_copy() -> None:
     # Mutating snap should not affect the store
     snap["flags"]["a"] = False
     assert store.is_enabled("a") is True
+
+
+# ------------------------------------------------------------------
+# Usage metrics
+# ------------------------------------------------------------------
+
+
+class TestMetrics:
+    def test_metrics_start_empty(self) -> None:
+        store = FlagStore()
+        assert store.export_metrics() == {}
+
+    def test_counters_initialise_on_first_call(self) -> None:
+        store = FlagStore()
+        store.load({"feat": True})
+        store.is_enabled("feat")
+
+        metrics = store.export_metrics()
+        assert metrics["feat"] == {
+            "enabled_count": 1,
+            "disabled_count": 0,
+            "total_evaluations": 1,
+        }
+
+    def test_three_enabled_evaluations(self) -> None:
+        store = FlagStore()
+        store.load({"feat": True})
+        for _ in range(3):
+            store.is_enabled("feat")
+
+        metrics = store.export_metrics()
+        assert metrics["feat"]["enabled_count"] == 3
+        assert metrics["feat"]["disabled_count"] == 0
+        assert metrics["feat"]["total_evaluations"] == 3
+
+    def test_mixed_enabled_and_disabled_evaluations(self) -> None:
+        store = FlagStore()
+        store.load({"feat": True})
+        store.is_enabled("feat")
+        store.is_enabled("feat")
+
+        # Override to disabled, then evaluate twice more
+        store.override("feat", False)
+        store.is_enabled("feat")
+        store.is_enabled("feat")
+        store.is_enabled("feat")
+
+        metrics = store.export_metrics()
+        assert metrics["feat"]["enabled_count"] == 2
+        assert metrics["feat"]["disabled_count"] == 3
+        assert metrics["feat"]["total_evaluations"] == 5
+
+    def test_different_flags_tracked_independently(self) -> None:
+        store = FlagStore()
+        store.load({"a": True, "b": False})
+        store.is_enabled("a")
+        store.is_enabled("a")
+        store.is_enabled("b")
+
+        metrics = store.export_metrics()
+        assert metrics["a"] == {
+            "enabled_count": 2,
+            "disabled_count": 0,
+            "total_evaluations": 2,
+        }
+        assert metrics["b"] == {
+            "enabled_count": 0,
+            "disabled_count": 1,
+            "total_evaluations": 1,
+        }
+
+    def test_reset_metrics_zeros_counters_but_keeps_flags(self) -> None:
+        store = FlagStore()
+        store.load({"feat": True})
+        store.is_enabled("feat")
+        store.is_enabled("feat")
+        assert store.export_metrics()["feat"]["total_evaluations"] == 2
+
+        store.reset_metrics()
+        assert store.export_metrics() == {}
+
+        # Flag definition is still intact
+        assert store.is_enabled("feat") is True
+        assert store.export_metrics()["feat"] == {
+            "enabled_count": 1,
+            "disabled_count": 0,
+            "total_evaluations": 1,
+        }
+
+    def test_reset_does_not_clear_metrics(self) -> None:
+        store = FlagStore()
+        store.load({"feat": True})
+        store.is_enabled("feat")
+
+        store.reset()
+
+        metrics = store.export_metrics()
+        assert metrics["feat"]["total_evaluations"] == 1
+        assert metrics["feat"]["enabled_count"] == 1
+
+    def test_export_metrics_returns_isolated_copy(self) -> None:
+        store = FlagStore()
+        store.load({"feat": True})
+        store.is_enabled("feat")
+
+        snap = store.export_metrics()
+        snap["feat"]["enabled_count"] = 999
+
+        live = store.export_metrics()
+        assert live["feat"]["enabled_count"] == 1
+
+    def test_threaded_increments(self) -> None:
+        store = FlagStore()
+        store.load({"feat": True})
+
+        def evaluate_many() -> None:
+            for _ in range(100):
+                store.is_enabled("feat")
+
+        threads = [Thread(target=evaluate_many) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        metrics = store.export_metrics()
+        assert metrics["feat"]["total_evaluations"] == 1000
+        assert metrics["feat"]["enabled_count"] == 1000
+        assert metrics["feat"]["disabled_count"] == 0

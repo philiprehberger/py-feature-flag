@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 (2026-04-27)
+
+- Add per-flag usage tracking with `enabled_count`, `disabled_count`, and `total_evaluations` counters
+- Add `export_metrics()` method returning a snapshot of usage telemetry
+- Add `reset_metrics()` method to zero counters without touching flag definitions
+
 ## 0.3.0 (2026-04-01)
 
 - Add user segment targeting with `define_segment()` and `remove_segment()` for enabling flags by user group attributes
